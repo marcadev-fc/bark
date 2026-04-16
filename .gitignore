@@ -1,0 +1,7 @@
+# Generated dashboard output — never commit HTML output (may contain customer data)
+*.html
+output/
+dist/
+__pycache__/
+*.pyc
+.DS_Store
