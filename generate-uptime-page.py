@@ -40,8 +40,6 @@ def dogweb_base(domain):
         return f"https://{domain}"
     return f"https://dd.{domain}"
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
 def uptime_color(pct):
     if pct is None: return "#94a3b8"
     if pct >= 99.9: return "#22c55e"
@@ -100,12 +98,33 @@ def extract_endpoint(name, test_type):
     if test_type == "network":
         return name.replace("Network Path: ", "").strip()
     if test_type == "browser":
-        return name
+        return name  # placeholder — overridden in fetch_suite_data post-processing
     m = re.match(r'^((?:GET|POST|PUT|DELETE|PATCH)\s+\S+)\s+\(', name)
     if m:
         endpoint = m.group(1)
-        return endpoint.split("?")[0]
+        path_part = endpoint.split("?")[0]
+        return path_part
     return name
+
+_CDN_HOST_FRAGS = ["scene7.com", "cloudfront.net", "akamaized.net", "fastly.net",
+                   "cdn77.com", "edgekey.net", "edgesuite.net", "akamai.net",
+                   "imgix.net", "twimg.com", "gravatar.com"]
+_CDN_PATH_FRAGS = ["/is/image/", "/is/content/", "/static/assets/", "/assets/images/"]
+_ASSET_EXTS     = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico",
+                   ".woff", ".woff2", ".ttf", ".eot", ".pdf"}
+
+def _is_cdn_endpoint(ep):
+    """Return True if the endpoint looks like a CDN or static-asset URL."""
+    ep_l = ep.lower()
+    if any(h in ep_l for h in _CDN_HOST_FRAGS):
+        return True
+    if any(p in ep_l for p in _CDN_PATH_FRAGS):
+        return True
+    # Check file extension on the path portion (strip method prefix and query string)
+    path = ep_l.split("?")[0]
+    tokens = path.split()
+    path = tokens[-1] if tokens else path  # handle "GET /path/foo.jpg"
+    return any(path.endswith(x) for x in _ASSET_EXTS)
 
 def card_title(name, test_type, short_name=""):
     """Concise, human-readable summary of what the test validates."""
@@ -125,6 +144,39 @@ def card_title(name, test_type, short_name=""):
             last = re.sub(r'\.(html?|json|xml|js|css)$', '', segs[-1]).replace("-"," ").replace("_"," ").lower()
             return f"{last.capitalize()} data loads correctly for every request"
     return "The API responds with the right data every time"
+
+def build_graph_nodes(tests):
+    nodes, edges, seen = [], [], {}
+    def add_node(nid, label, kind, url=""):
+        if nid not in seen:
+            seen[nid] = len(nodes)
+            nodes.append({"id": nid, "label": label, "kind": kind, "url": url})
+    add_node("root", "Entry", "root", "")
+    browser = [t for t in tests if t["type"] == "browser"]
+    network = [t for t in tests if t["type"] == "network"]
+    support = [t for t in tests if t["type"] == "api"
+               and ("countryLang" in t.get("raw_name","") or "image" in t.get("raw_name","").lower())]
+    pages   = [t for t in tests if t["type"] == "api" and t not in support]
+    for t in browser:
+        nid = f"br_{t['public_id']}"
+        add_node(nid, t["short_name"], "browser", f"https://app.datadoghq.com/synthetics/details/{t['public_id']}")
+        edges.append({"source": "root", "target": nid})
+    prev = "root" if not browser else f"br_{browser[0]['public_id']}"
+    page_nids = []
+    for t in pages:
+        nid = f"pg_{t['public_id']}"
+        add_node(nid, t["short_name"], "page", f"https://app.datadoghq.com/synthetics/details/{t['public_id']}")
+        edges.append({"source": prev, "target": nid})
+        page_nids.append(nid); prev = nid
+    for i, t in enumerate(support):
+        nid = f"api_{t['public_id']}"
+        add_node(nid, t["short_name"], "api", f"https://app.datadoghq.com/synthetics/details/{t['public_id']}")
+        edges.append({"source": page_nids[i % len(page_nids)] if page_nids else "root", "target": nid})
+    for t in network:
+        nid = f"net_{t['public_id']}"
+        add_node(nid, t["short_name"], "network", f"https://app.datadoghq.com/synthetics/details/{t['public_id']}")
+        edges.append({"source": "root", "target": nid})
+    return nodes, edges
 
 
 # ── SVG / HTML components ─────────────────────────────────────────────────────
@@ -146,6 +198,17 @@ def ring_svg(pct, color, size=96):
         f' font-size="16" font-weight="800" font-family="-apple-system,BlinkMacSystemFont,sans-serif">{label}</text>'
         f'</svg>'
     )
+
+def pulse_bar_html(flags, seg_w=5, seg_h=18, count=None):
+    """Horizontal pulse bar, oldest left, newest right."""
+    if count:
+        flags = (list(reversed(flags)) + [None] * count)[:count]
+        flags = list(reversed(flags))
+    segs = ""
+    for f in reversed(flags):  # reverse so oldest is leftmost
+        cls = "pass" if f is True else ("fail" if f is False else "nd")
+        segs += f'<i class="ps {cls}"></i>'
+    return f'<div class="pulse-bar">{segs}</div>'
 
 def mini_pulse_segs(flags, count=28):
     """Just the <i> segment elements for a compact pulse bar."""
@@ -213,6 +276,24 @@ def fetch_suite_data(domain, base_url, suite_id, ts_24h_ms):
             tests.append({"public_id": pid, "raw_name": pid, "short_name": pid,
                           "context": "", "type": "api", "uptime": None,
                           "results": [], "last_passed": None, "last_ts": None, "last_fail_ts": 0})
+
+    # Post-process: tag CDN tests and resolve browser test endpoint coverage
+    non_cdn_api_eps = [
+        t["endpoint"] for t in tests
+        if t["type"] == "api" and not _is_cdn_endpoint(t.get("endpoint", ""))
+    ]
+    for t in tests:
+        if t["type"] == "browser":
+            t["is_cdn"]   = False
+            t["endpoints"] = non_cdn_api_eps if non_cdn_api_eps else [
+                t.get("test_url", "").replace("https://", "") or t["raw_name"]
+            ]
+        elif t["type"] == "api":
+            t["is_cdn"]   = _is_cdn_endpoint(t.get("endpoint", ""))
+            t["endpoints"] = [t.get("endpoint", t["raw_name"])]
+        else:
+            t["is_cdn"]   = False
+            t["endpoints"] = [t.get("endpoint", t["raw_name"])]
 
     last_ts_overall   = max((t["last_ts"] for t in tests if t["last_ts"]), default=None)
     last_fail_overall = max((t.get("last_fail_ts", 0) for t in tests), default=0)
@@ -333,6 +414,7 @@ def render_index_html(all_suites, base_url, domain, generated_at,
         card_cls   = "passing" if passing is True else ("failing" if passing is False else "nodata")
         state_label = "✓ Passing" if passing is True else ("✗ Failing" if passing is False else "— No data")
         n_tests    = len(s["tests"])
+        gauge      = ring_svg(s["uptime_24h"], color, size=100)
         pulse      = mini_pulse_html(s["all_flags"])
         name_short = s["suite_name"][:48] + ("…" if len(s["suite_name"]) > 48 else "")
         last_fail  = s.get("last_fail_ts", 0) or 0
@@ -525,6 +607,7 @@ def render_index_html(all_suites, base_url, domain, generated_at,
     .card-state.failing{{background:#450a0a;color:#fca5a5}}
     .card-state.nodata{{background:#1a1040;color:#475569}}
     .card-state.pending{{background:#1a1040;color:#818cf8}}
+    /* ── Uptime viz ── */
     .card-uptime{{display:flex;align-items:center;gap:8px;padding:4px 0 2px;width:100%}}
     .card-pct{{font-size:18px;font-weight:800;font-variant-numeric:tabular-nums;flex-shrink:0;line-height:1;white-space:nowrap;letter-spacing:-0.02em}}
     .card-window{{text-align:center;font-size:10px;color:#2d1b69;font-weight:600;text-transform:uppercase;letter-spacing:.07em;margin-top:2px}}
@@ -617,10 +700,11 @@ def render_detail_html(data, base_url, generated_at, multi_suite):
     up_cls        = "passing" if suite_passing is True else ("failing" if suite_passing is False else "nodata")
     up_label      = "✓ Passing" if suite_passing is True else ("✗ Failing" if suite_passing is False else "— No data")
 
-    # Op-bar status
-    n_total   = len(tests)
-    n_passing = sum(1 for t in tests if t["last_passed"] is True)
-    n_failing = sum(1 for t in tests if t["last_passed"] is False)
+    # Op-bar status (exclude CDN tests from counts)
+    visible   = [t for t in tests if not t.get("is_cdn")]
+    n_total   = len(visible)
+    n_passing = sum(1 for t in visible if t["last_passed"] is True)
+    n_failing = sum(1 for t in visible if t["last_passed"] is False)
     t_word    = f'test{"s" if n_total != 1 else ""}'
     if n_total == 0:
         op_html = f'<span class="op-msg nodata">{suite_name} — no test data available</span>'
@@ -633,42 +717,52 @@ def render_detail_html(data, base_url, generated_at, multi_suite):
                    f' <strong>{suite_name}</strong>'
                    f' — {n_passing} of {n_total} {t_word} passing, {n_failing} failing')
 
-    # Test cards
-    test_cards = ""
+    # Test rows (list layout — CDN tests hidden)
+    test_rows = ""
     for t in tests:
+        if t.get("is_cdn"):
+            continue
         color      = uptime_color(t["uptime"])
         pct        = (f"{t['uptime']:.1f}".rstrip('0').rstrip('.') + '%') if t["uptime"] is not None else "—"
         ts_str     = (datetime.datetime.fromtimestamp(t["last_ts"]).strftime("%H:%M %d %b")
                       if t["last_ts"] else "—")
         dd_url     = f"{base_url}/synthetics/details/{t['public_id']}"
         pulse      = mini_pulse_html(t["results"])
-        card_cls   = "passing" if t["last_passed"] is True else ("failing" if t["last_passed"] is False else "nodata")
-        type_label = "network path" if t['type'] == "network" else t['type']
+        row_cls    = "passing" if t["last_passed"] is True else ("failing" if t["last_passed"] is False else "nodata")
+        type_label = {"browser": "browser", "api": "api", "network": "network"}.get(t['type'], t['type'])
         last_fail  = t.get("last_fail_ts", 0) or 0
-        test_cards += f"""
-    <a class="tcard {card_cls}" href="{dd_url}" target="_blank"
+        endpoints  = t.get("endpoints", [t.get("endpoint", t["raw_name"])])
+
+        if t["type"] == "browser":
+            eps_html = "".join(
+                f'<code class="trow-ep-item">{ep}</code>'
+                for ep in endpoints[:6]
+            )
+            if len(endpoints) > 6:
+                eps_html += f'<span class="trow-ep-more">+{len(endpoints)-6} more</span>'
+            ep_block = f'<div class="trow-eps">{eps_html}</div>'
+        else:
+            ep_block = f'<code class="trow-ep">{endpoints[0] if endpoints else ""}</code>'
+
+        test_rows += f"""
+    <a class="trow {row_cls}" href="{dd_url}" target="_blank"
        data-name="{t['short_name'].lower()}" data-lastfail="{last_fail}" data-type="{t['type']}">
-      <div class="tcard-top">
-        <div class="tcard-name-wrap">
-          <div class="tcard-name tcard-endpoint">{t['endpoint']}</div>
-        </div>
-        {state_badge_html(t['last_passed'])}
-      </div>
-      <div class="tcard-uptime">
-        <span class="tcard-pct" style="color:{color}">{pct}</span>
-        {pulse}
-      </div>
-      <div class="tcard-foot">
-        <span class="tcard-type">{type_label}</span>
-        <span class="tcard-ts">{ts_str}</span>
+      <span class="trow-dot {row_cls}"></span>
+      <div class="trow-body">{ep_block}</div>
+      <span class="trow-pct" style="color:{color}">{pct}</span>
+      {pulse}
+      <div class="trow-meta">
+        <span class="trow-type">{type_label}</span>
+        <span class="trow-ts">{ts_str}</span>
       </div>
     </a>"""
 
     back_link = '<a class="back-link" href="index.html">← All journeys</a>'
 
-    # Filter buttons — only show types that actually exist in this suite
+    # Filter buttons — only show types present in visible (non-CDN) tests
     type_label_map = {"browser": "Browser", "api": "API", "network": "Network path"}
-    present_types  = sorted({t["type"] for t in tests}, key=lambda x: list(type_label_map).index(x) if x in type_label_map else 99)
+    present_types  = sorted({t["type"] for t in tests if not t.get("is_cdn")},
+                            key=lambda x: list(type_label_map).index(x) if x in type_label_map else 99)
     filter_btns = '<button class="sort-btn active" data-filter="all" onclick="filterCards(\'all\')">All</button>'
     for tp in present_types:
         label = type_label_map.get(tp, tp.title())
@@ -696,7 +790,7 @@ def render_detail_html(data, base_url, generated_at, multi_suite):
   <title>{suite_name} — Bark</title>
   <style>
     {SHARED_CSS}
-    /* ── Detail hero ── */
+    /* ── Detail hero (same gradient/size as home page hero) ── */
     .detail-hero{{
       padding: 32px 56px 44px;
       background: linear-gradient(145deg, #1a0d2e 0%, #0f1535 45%, #0a1628 100%);
@@ -727,7 +821,7 @@ def render_detail_html(data, base_url, generated_at, multi_suite):
     .uh-badge.passing{{background:#14532d;color:#86efac}}
     .uh-badge.failing{{background:#450a0a;color:#fca5a5}}
     .uh-badge.nodata{{background:#1a1040;color:#475569}}
-    /* ── Op-bar + sort ── */
+    /* ── Op-bar + sort (shared with home page) ── */
     .op-bar{{display:flex;align-items:center;justify-content:space-between;
              padding:12px 56px;border-bottom:1px solid #1e1040;
              font-size:14px;color:#94a3b8;background:#0d0e1f}}
@@ -747,34 +841,47 @@ def render_detail_html(data, base_url, generated_at, multi_suite):
     .content{{padding:24px 56px 52px;background:linear-gradient(180deg,#0d0e1f 0%,#090c1a 100%)}}
     .section-title{{font-size:10px;font-weight:700;color:#2d1b69;text-transform:uppercase;
                     letter-spacing:.1em;margin-bottom:14px}}
-    /* ── Pulse bars ── */
+    /* ── Pulse bars (same system as home page cards) ── */
     .mpb{{display:flex;gap:2px;align-items:flex-end;flex:1;min-width:0;overflow:hidden;height:30px}}
     i.mp{{display:inline-block;width:4px;flex-shrink:1;border-radius:2px;font-style:normal}}
     i.mp.p{{background:#22c55e;height:100%}}
     i.mp.f{{background:#ef4444;height:100%}}
     i.mp.n{{background:#1e1040;height:50%}}
-    /* ── Test cards grid ── */
-    .test-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}}
-    @media(max-width:1100px){{.test-grid{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}
-    @media(max-width:780px){{.test-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}
-    @media(max-width:520px){{.test-grid{{grid-template-columns:1fr}}}}
-    .tcard{{background:#12102a;border-radius:12px;padding:18px 16px 14px;
-            display:flex;flex-direction:column;gap:10px;text-decoration:none;color:inherit;
-            border:1px solid #2d1b6944;transition:transform .15s,box-shadow .15s,border-color .15s}}
-    .tcard.passing{{border-top:2px solid #22c55e60}}
-    .tcard.failing{{border-top:2px solid #ef444460}}
-    .tcard.nodata{{border-top:2px solid #2d1b6940}}
-    .tcard:hover{{transform:translateY(-3px);box-shadow:0 12px 36px #00000070,0 0 0 1px #632ca630;border-color:#632ca655}}
-    .tcard-top{{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;min-height:42px}}
-    .tcard-name-wrap{{flex:1;min-width:0}}
-    .tcard-name{{font-size:13px;font-weight:600;color:#e2e8f0;line-height:1.4;
-                display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}}
-    .tcard-endpoint{{font-family:monospace;font-size:11px;font-weight:500;color:#a5b4fc;word-break:break-all}}
-    .tcard-uptime{{display:flex;align-items:center;gap:8px;padding:2px 0}}
-    .tcard-pct{{font-size:18px;font-weight:800;font-variant-numeric:tabular-nums;flex-shrink:0;line-height:1;white-space:nowrap;letter-spacing:-0.02em}}
-    .tcard-foot{{display:flex;align-items:center;justify-content:space-between;margin-top:2px}}
-    .tcard-type{{background:#1a1040;color:#818cf8;font-size:10px;padding:2px 7px;border-radius:4px;font-family:monospace}}
-    .tcard-ts{{color:#3d2a69;font-size:10px}}
+    /* ── Test list ── */
+    .test-list{{display:flex;flex-direction:column;gap:3px}}
+    .trow{{
+      display:grid;
+      grid-template-columns:8px 1fr auto 150px 80px;
+      gap:16px;
+      align-items:center;
+      padding:12px 16px;
+      background:#12102a;
+      border-radius:8px;
+      text-decoration:none;
+      color:inherit;
+      border:1px solid #2d1b6918;
+      border-left:3px solid transparent;
+      transition:background .12s,border-left-color .15s;
+    }}
+    .trow.passing{{border-left-color:#22c55e80}}
+    .trow.failing{{border-left-color:#ef444480}}
+    .trow.nodata{{border-left-color:#2d1b6960}}
+    .trow:hover{{background:#1a1535;border-left-color:#7c3aed}}
+    .trow-dot{{width:8px;height:8px;border-radius:50%;flex-shrink:0}}
+    .trow-dot.passing{{background:#22c55e}}
+    .trow-dot.failing{{background:#ef4444}}
+    .trow-dot.nodata{{background:#334155}}
+    .trow-body{{min-width:0}}
+    .trow-ep{{font-family:monospace;font-size:12px;color:#a5b4fc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}}
+    .trow-eps{{display:flex;flex-direction:column;gap:3px}}
+    .trow-ep-item{{font-family:monospace;font-size:11px;color:#a5b4fc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+    .trow-ep-more{{font-size:10px;color:#475569;margin-top:1px}}
+    .trow-pct{{font-size:16px;font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap;letter-spacing:-0.02em;text-align:right}}
+    .trow .mpb{{width:150px;flex:none;height:22px}}
+    .trow .mpb i.mp{{flex-grow:1;max-width:8px}}
+    .trow-meta{{display:flex;flex-direction:column;align-items:flex-end;gap:3px}}
+    .trow-type{{background:#1a1040;color:#818cf8;font-size:10px;padding:2px 7px;border-radius:4px;font-family:monospace}}
+    .trow-ts{{color:#3d2a69;font-size:10px}}
   </style>
 </head>
 <body>
@@ -817,7 +924,7 @@ def render_detail_html(data, base_url, generated_at, multi_suite):
 </div>
 
 <div class="content">
-  <div class="test-grid" id="cards-grid">{test_cards}
+  <div class="test-list" id="cards-grid">{test_rows}
   </div>
 </div>
 
