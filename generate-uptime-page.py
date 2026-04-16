@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Bark — Voyager Uptime Page Generator
-Generates a static HTML index dashboard + per-suite detail pages from Datadog Synthetics.
+Voyager Uptime Page Generator
+Generates an index dashboard + per-suite detail pages.
 
 Usage:
   # Explicit suite IDs:
@@ -11,11 +11,8 @@ Usage:
   python3 generate-uptime-page.py <domain> <output_dir> --crawler <crawler_id> [suite_id ...]
 
 Examples:
-  python3 generate-uptime-page.py app.datadoghq.com ~/Desktop/dashboard abc-123-xyz
-  python3 generate-uptime-page.py app.datadoghq.com ~/Desktop/dashboard --crawler <crawler_id> abc-123-xyz
-
-Requirements:
-  - dd-auth (https://github.com/DataDog/dd-auth) installed and configured
+  python3 generate-uptime-page.py app.datadoghq.com ~/Desktop/voyager nki-p6u-36j
+  python3 generate-uptime-page.py app.datadoghq.com ~/Desktop/voyager --crawler 0e034cd3-e945-4b57-8914-40ed4c7fafd8 nki-p6u-36j
 """
 import subprocess, json, sys, os, re, datetime
 from urllib.parse import unquote
@@ -689,7 +686,7 @@ sortCards('name');
 
 # ── Detail page renderer ──────────────────────────────────────────────────────
 
-def render_detail_html(data, base_url, generated_at, multi_suite):
+def render_detail_html(data, base_url, generated_at, multi_suite, layout='list'):
     suite_id      = data["suite_id"]
     suite_name    = data["suite_name"]
     tests         = data["tests"]
@@ -700,11 +697,14 @@ def render_detail_html(data, base_url, generated_at, multi_suite):
     up_cls        = "passing" if suite_passing is True else ("failing" if suite_passing is False else "nodata")
     up_label      = "✓ Passing" if suite_passing is True else ("✗ Failing" if suite_passing is False else "— No data")
 
-    # Op-bar status (exclude CDN tests from counts)
-    visible   = [t for t in tests if not t.get("is_cdn")]
-    n_total   = len(visible)
-    n_passing = sum(1 for t in visible if t["last_passed"] is True)
-    n_failing = sum(1 for t in visible if t["last_passed"] is False)
+    # Op-bar status
+    if layout == 'cards':
+        count_set = tests
+    else:
+        count_set = [t for t in tests if not t.get("is_cdn")]
+    n_total   = len(count_set)
+    n_passing = sum(1 for t in count_set if t["last_passed"] is True)
+    n_failing = sum(1 for t in count_set if t["last_passed"] is False)
     t_word    = f'test{"s" if n_total != 1 else ""}'
     if n_total == 0:
         op_html = f'<span class="op-msg nodata">{suite_name} — no test data available</span>'
@@ -717,34 +717,90 @@ def render_detail_html(data, base_url, generated_at, multi_suite):
                    f' <strong>{suite_name}</strong>'
                    f' — {n_passing} of {n_total} {t_word} passing, {n_failing} failing')
 
-    # Test rows (list layout — CDN tests hidden)
-    test_rows = ""
-    for t in tests:
-        if t.get("is_cdn"):
-            continue
-        color      = uptime_color(t["uptime"])
-        pct        = (f"{t['uptime']:.1f}".rstrip('0').rstrip('.') + '%') if t["uptime"] is not None else "—"
-        ts_str     = (datetime.datetime.fromtimestamp(t["last_ts"]).strftime("%H:%M %d %b")
-                      if t["last_ts"] else "—")
-        dd_url     = f"{base_url}/synthetics/details/{t['public_id']}"
-        pulse      = mini_pulse_html(t["results"])
-        row_cls    = "passing" if t["last_passed"] is True else ("failing" if t["last_passed"] is False else "nodata")
-        type_label = {"browser": "browser", "api": "api", "network": "network"}.get(t['type'], t['type'])
-        last_fail  = t.get("last_fail_ts", 0) or 0
-        endpoints  = t.get("endpoints", [t.get("endpoint", t["raw_name"])])
+    type_label_map = {"browser": "Browser", "api": "API", "network": "Network path"}
 
-        if t["type"] == "browser":
-            eps_html = "".join(
-                f'<code class="trow-ep-item">{ep}</code>'
-                for ep in endpoints[:6]
-            )
-            if len(endpoints) > 6:
-                eps_html += f'<span class="trow-ep-more">+{len(endpoints)-6} more</span>'
-            ep_block = f'<div class="trow-eps">{eps_html}</div>'
-        else:
-            ep_block = f'<code class="trow-ep">{endpoints[0] if endpoints else ""}</code>'
+    if layout == 'cards':
+        # ── Card grid rendering ──
+        test_html = ""
+        for t in tests:
+            color      = uptime_color(t["uptime"])
+            pct        = (f"{t['uptime']:.1f}".rstrip('0').rstrip('.') + '%') if t["uptime"] is not None else "—"
+            ts_str     = (datetime.datetime.fromtimestamp(t["last_ts"]).strftime("%H:%M %d %b")
+                          if t["last_ts"] else "—")
+            dd_url     = f"{base_url}/synthetics/details/{t['public_id']}"
+            pulse      = mini_pulse_html(t["results"])
+            card_cls   = "passing" if t["last_passed"] is True else ("failing" if t["last_passed"] is False else "nodata")
+            tlabel     = "network path" if t['type'] == "network" else t['type']
+            last_fail  = t.get("last_fail_ts", 0) or 0
+            test_html += f"""
+    <a class="tcard {card_cls}" href="{dd_url}" target="_blank"
+       data-name="{t['short_name'].lower()}" data-lastfail="{last_fail}" data-type="{t['type']}">
+      <div class="tcard-top">
+        <div class="tcard-name-wrap">
+          <div class="tcard-name tcard-endpoint">{t['endpoint']}</div>
+        </div>
+        {state_badge_html(t['last_passed'])}
+      </div>
+      <div class="tcard-uptime">
+        <span class="tcard-pct" style="color:{color}">{pct}</span>
+        {pulse}
+      </div>
+      <div class="tcard-foot">
+        <span class="tcard-type">{tlabel}</span>
+        <span class="tcard-ts">{ts_str}</span>
+      </div>
+    </a>"""
+        container_cls = "test-grid"
+        present_types = sorted({t["type"] for t in tests},
+                               key=lambda x: list(type_label_map).index(x) if x in type_label_map else 99)
+        layout_css = """
+    /* ── Test cards grid ── */
+    .test-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}}
+    @media(max-width:1100px){{.test-grid{{grid-template-columns:repeat(3,minmax(0,1fr))}}}}
+    @media(max-width:780px){{.test-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}
+    @media(max-width:520px){{.test-grid{{grid-template-columns:1fr}}}}
+    .tcard{{background:#12102a;border-radius:12px;padding:18px 16px 14px;
+            display:flex;flex-direction:column;gap:10px;text-decoration:none;color:inherit;
+            border:1px solid #2d1b6944;transition:transform .15s,box-shadow .15s,border-color .15s}}
+    .tcard.passing{{border-top:2px solid #22c55e60}}
+    .tcard.failing{{border-top:2px solid #ef444460}}
+    .tcard.nodata{{border-top:2px solid #2d1b6940}}
+    .tcard:hover{{transform:translateY(-3px);box-shadow:0 12px 36px #00000070,0 0 0 1px #632ca630;border-color:#632ca655}}
+    .tcard-top{{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;min-height:42px}}
+    .tcard-name-wrap{{flex:1;min-width:0}}
+    .tcard-name{{font-size:13px;font-weight:600;color:#e2e8f0;line-height:1.4;
+                display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}}
+    .tcard-endpoint{{font-family:monospace;font-size:11px;font-weight:500;color:#a5b4fc;word-break:break-all}}
+    .tcard-uptime{{display:flex;align-items:center;gap:8px;padding:2px 0}}
+    .tcard-pct{{font-size:18px;font-weight:800;font-variant-numeric:tabular-nums;flex-shrink:0;line-height:1;white-space:nowrap;letter-spacing:-0.02em}}
+    .tcard-foot{{display:flex;align-items:center;justify-content:space-between;margin-top:2px}}
+    .tcard-type{{background:#1a1040;color:#818cf8;font-size:10px;padding:2px 7px;border-radius:4px;font-family:monospace}}
+    .tcard-ts{{color:#3d2a69;font-size:10px}}"""
 
-        test_rows += f"""
+    else:
+        # ── List rendering (CDN tests hidden) ──
+        test_html = ""
+        for t in tests:
+            if t.get("is_cdn"):
+                continue
+            color      = uptime_color(t["uptime"])
+            pct        = (f"{t['uptime']:.1f}".rstrip('0').rstrip('.') + '%') if t["uptime"] is not None else "—"
+            ts_str     = (datetime.datetime.fromtimestamp(t["last_ts"]).strftime("%H:%M %d %b")
+                          if t["last_ts"] else "—")
+            dd_url     = f"{base_url}/synthetics/details/{t['public_id']}"
+            pulse      = mini_pulse_html(t["results"])
+            row_cls    = "passing" if t["last_passed"] is True else ("failing" if t["last_passed"] is False else "nodata")
+            tlabel     = {"browser": "browser", "api": "api", "network": "network"}.get(t['type'], t['type'])
+            last_fail  = t.get("last_fail_ts", 0) or 0
+            endpoints  = t.get("endpoints", [t.get("endpoint", t["raw_name"])])
+            if t["type"] == "browser":
+                eps_html = "".join(f'<code class="trow-ep-item">{ep}</code>' for ep in endpoints[:6])
+                if len(endpoints) > 6:
+                    eps_html += f'<span class="trow-ep-more">+{len(endpoints)-6} more</span>'
+                ep_block = f'<div class="trow-eps">{eps_html}</div>'
+            else:
+                ep_block = f'<code class="trow-ep">{endpoints[0] if endpoints else ""}</code>'
+            test_html += f"""
     <a class="trow {row_cls}" href="{dd_url}" target="_blank"
        data-name="{t['short_name'].lower()}" data-lastfail="{last_fail}" data-type="{t['type']}">
       <span class="trow-dot {row_cls}"></span>
@@ -752,17 +808,43 @@ def render_detail_html(data, base_url, generated_at, multi_suite):
       <span class="trow-pct" style="color:{color}">{pct}</span>
       {pulse}
       <div class="trow-meta">
-        <span class="trow-type">{type_label}</span>
+        <span class="trow-type">{tlabel}</span>
         <span class="trow-ts">{ts_str}</span>
       </div>
     </a>"""
+        container_cls = "test-list"
+        present_types = sorted({t["type"] for t in tests if not t.get("is_cdn")},
+                               key=lambda x: list(type_label_map).index(x) if x in type_label_map else 99)
+        layout_css = """
+    /* ── Test list ── */
+    .test-list{{display:flex;flex-direction:column;gap:3px}}
+    .trow{{display:grid;grid-template-columns:8px 1fr auto 150px 80px;gap:16px;align-items:center;
+           padding:12px 16px;background:#12102a;border-radius:8px;text-decoration:none;color:inherit;
+           border:1px solid #2d1b6918;border-left:3px solid transparent;transition:background .12s,border-left-color .15s}}
+    .trow.passing{{border-left-color:#22c55e80}}
+    .trow.failing{{border-left-color:#ef444480}}
+    .trow.nodata{{border-left-color:#2d1b6960}}
+    .trow:hover{{background:#1a1535;border-left-color:#7c3aed}}
+    .trow-dot{{width:8px;height:8px;border-radius:50%;flex-shrink:0}}
+    .trow-dot.passing{{background:#22c55e}}
+    .trow-dot.failing{{background:#ef4444}}
+    .trow-dot.nodata{{background:#334155}}
+    .trow-body{{min-width:0}}
+    .trow-ep{{font-family:monospace;font-size:12px;color:#a5b4fc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}}
+    .trow-eps{{display:flex;flex-direction:column;gap:3px}}
+    .trow-ep-item{{font-family:monospace;font-size:11px;color:#a5b4fc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+    .trow-ep-more{{font-size:10px;color:#475569;margin-top:1px}}
+    .trow-pct{{font-size:16px;font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap;letter-spacing:-0.02em;text-align:right}}
+    .trow .mpb{{width:150px;flex:none;height:22px}}
+    .trow .mpb i.mp{{flex-grow:1;max-width:8px}}
+    .trow-meta{{display:flex;flex-direction:column;align-items:flex-end;gap:3px}}
+    .trow-type{{background:#1a1040;color:#818cf8;font-size:10px;padding:2px 7px;border-radius:4px;font-family:monospace}}
+    .trow-ts{{color:#3d2a69;font-size:10px}}"""
 
     back_link = '<a class="back-link" href="index.html">← All journeys</a>'
 
-    # Filter buttons — only show types present in visible (non-CDN) tests
-    type_label_map = {"browser": "Browser", "api": "API", "network": "Network path"}
-    present_types  = sorted({t["type"] for t in tests if not t.get("is_cdn")},
-                            key=lambda x: list(type_label_map).index(x) if x in type_label_map else 99)
+    # Filter buttons
+    present_types  # already set per layout above
     filter_btns = '<button class="sort-btn active" data-filter="all" onclick="filterCards(\'all\')">All</button>'
     for tp in present_types:
         label = type_label_map.get(tp, tp.title())
@@ -847,41 +929,7 @@ def render_detail_html(data, base_url, generated_at, multi_suite):
     i.mp.p{{background:#22c55e;height:100%}}
     i.mp.f{{background:#ef4444;height:100%}}
     i.mp.n{{background:#1e1040;height:50%}}
-    /* ── Test list ── */
-    .test-list{{display:flex;flex-direction:column;gap:3px}}
-    .trow{{
-      display:grid;
-      grid-template-columns:8px 1fr auto 150px 80px;
-      gap:16px;
-      align-items:center;
-      padding:12px 16px;
-      background:#12102a;
-      border-radius:8px;
-      text-decoration:none;
-      color:inherit;
-      border:1px solid #2d1b6918;
-      border-left:3px solid transparent;
-      transition:background .12s,border-left-color .15s;
-    }}
-    .trow.passing{{border-left-color:#22c55e80}}
-    .trow.failing{{border-left-color:#ef444480}}
-    .trow.nodata{{border-left-color:#2d1b6960}}
-    .trow:hover{{background:#1a1535;border-left-color:#7c3aed}}
-    .trow-dot{{width:8px;height:8px;border-radius:50%;flex-shrink:0}}
-    .trow-dot.passing{{background:#22c55e}}
-    .trow-dot.failing{{background:#ef4444}}
-    .trow-dot.nodata{{background:#334155}}
-    .trow-body{{min-width:0}}
-    .trow-ep{{font-family:monospace;font-size:12px;color:#a5b4fc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}}
-    .trow-eps{{display:flex;flex-direction:column;gap:3px}}
-    .trow-ep-item{{font-family:monospace;font-size:11px;color:#a5b4fc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-    .trow-ep-more{{font-size:10px;color:#475569;margin-top:1px}}
-    .trow-pct{{font-size:16px;font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap;letter-spacing:-0.02em;text-align:right}}
-    .trow .mpb{{width:150px;flex:none;height:22px}}
-    .trow .mpb i.mp{{flex-grow:1;max-width:8px}}
-    .trow-meta{{display:flex;flex-direction:column;align-items:flex-end;gap:3px}}
-    .trow-type{{background:#1a1040;color:#818cf8;font-size:10px;padding:2px 7px;border-radius:4px;font-family:monospace}}
-    .trow-ts{{color:#3d2a69;font-size:10px}}
+    {layout_css}
   </style>
 </head>
 <body>
@@ -924,7 +972,7 @@ def render_detail_html(data, base_url, generated_at, multi_suite):
 </div>
 
 <div class="content">
-  <div class="test-list" id="cards-grid">{test_rows}
+  <div class="{container_cls}" id="cards-grid">{test_html}
   </div>
 </div>
 
@@ -978,17 +1026,18 @@ def main():
     base_url   = f"https://{domain}"
     os.makedirs(output_dir, exist_ok=True)
 
-    # Parse --crawler flag
+    # Parse flags: --crawler, --layout
     crawler_id = None
+    layout     = 'list'
     suite_ids  = []
     i = 0
     while i < len(rest):
         if rest[i] == "--crawler" and i + 1 < len(rest):
-            crawler_id = rest[i + 1]
-            i += 2
+            crawler_id = rest[i + 1]; i += 2
+        elif rest[i] == "--layout" and i + 1 < len(rest):
+            layout = rest[i + 1]; i += 2
         else:
-            suite_ids.append(rest[i])
-            i += 1
+            suite_ids.append(rest[i]); i += 1
 
     if not suite_ids and not crawler_id:
         print("Usage: generate-uptime-page.py <domain> <output_dir> [--crawler <id>] <suite_id> ...")
@@ -1046,7 +1095,7 @@ def main():
 
     # Render detail pages for activated suites
     for data in all_data:
-        detail_html = render_detail_html(data, base_url, generated_at, multi_suite=multi_suite)
+        detail_html = render_detail_html(data, base_url, generated_at, multi_suite=multi_suite, layout=layout)
         detail_path = os.path.join(output_dir, f"{data['suite_id']}.html")
         with open(detail_path, "w") as f:
             f.write(detail_html)
